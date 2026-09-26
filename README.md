@@ -1348,3 +1348,8 @@ For issues and questions:
 _Built for the Stellar ecosystem. Open source. Community owned._
 
 </div>
+
+## Handsoff notes
+
+<!-- handsoff-issue-951 -->
+- #951: Add exactly-once on-chain publication with idempotency keys and nonce management
