@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -23,20 +23,32 @@ class QuorumSignature:
 
 
 @dataclass
-class NodeLiveness:
-    """Tracks heartbeat liveness for a single oracle node."""
-    name: str
-    last_heartbeat: float
-    is_active: bool = True
+class AggregationResult:
+    """Outcome of a BFT-tolerant quorum aggregation round.
+
+    Fault-tolerance model (3f+1):
+      * ``n`` total nodes, ``f = (n - 1) // 3`` tolerated Byzantine (malicious
+        or faulty) nodes.
+      * A quorum requires ``2f + 1`` agreeing reports, which guarantees that
+        any two quorums intersect in at least one honest node.
+      * Aggregation is correct as long as at most ``f`` nodes misreport.
+    """
+
+    value: int | None                       # agreed score, None if no quorum
+    agreeing: list[str]                     # node names in the winning quorum
+    dissenting: list[str]                   # node names whose report differed
+    slashed: list[str]                      # dissenting nodes proven inconsistent
+    quorum_size: int                        # number of agreeing reports
+    required_quorum: int                    # 2f + 1
+    tolerated_faults: int                   # f
+    is_valid_quorum: bool
 
 
 class OracleCoordinator:
     """
-    Coordinates threshold signatures across multiple OracleNodes.
-
-    Also monitors node liveness via periodic heartbeats and automatically
-    reconfigures the quorum threshold (within safe bounds) as the set of
-    active nodes changes.
+    Coordinates threshold signatures across multiple OracleNodes and performs
+    BFT-tolerant quorum aggregation with slashing for provably inconsistent
+    reports.
     """
 
     # A node is considered dead if no heartbeat arrives within this window.
@@ -51,82 +63,13 @@ class OracleCoordinator:
             raise ValueError(f"Threshold {threshold} > node count {len(nodes)}")
         self.nodes = nodes
         self.threshold = threshold
-        self._base_threshold = threshold
-        now = time.monotonic()
-        self._liveness: dict[str, NodeLiveness] = {
-            node.name: NodeLiveness(name=node.name, last_heartbeat=now)
-            for node in nodes
-        }
-
-    # ------------------------------------------------------------------
-    # Heartbeat liveness monitoring
-    # ------------------------------------------------------------------
-    def record_heartbeat(self, node_name: str, timestamp: float | None = None) -> None:
-        """Record a periodic heartbeat from an oracle node."""
-        liveness = self._liveness.get(node_name)
-        if liveness is None:
-            logger.warning("Heartbeat from unknown oracle node: %s", node_name)
-            return
-        liveness.last_heartbeat = timestamp if timestamp is not None else time.monotonic()
-        if not liveness.is_active:
-            logger.info("Oracle node %s rejoined the active set", node_name)
-        liveness.is_active = True
-
-    def _refresh_liveness(self, now: float | None = None) -> None:
-        """Mark nodes that missed the heartbeat window as inactive."""
-        now = now if now is not None else time.monotonic()
-        for liveness in self._liveness.values():
-            if liveness.is_active and (now - liveness.last_heartbeat) > self.HEARTBEAT_TIMEOUT_SECONDS:
-                liveness.is_active = False
-                logger.warning(
-                    "Oracle node %s missed heartbeat window (%.1fs); excluding from quorum",
-                    liveness.name,
-                    now - liveness.last_heartbeat,
-                )
-
-    def active_nodes(self, now: float | None = None) -> list[OracleNode]:
-        """Return nodes currently considered live (heartbeating)."""
-        self._refresh_liveness(now)
-        return [node for node in self.nodes if self._liveness[node.name].is_active]
-
-    # ------------------------------------------------------------------
-    # Automatic quorum reconfiguration
-    # ------------------------------------------------------------------
-    def reconfigure_quorum(self, now: float | None = None) -> int:
-        """
-        Recompute the quorum threshold based on the active node count.
-
-        The threshold is kept within safe bounds: never below MIN_ACTIVE_NODES
-        and never above the number of active nodes (so quorum stays achievable).
-        """
-        active_count = len(self.active_nodes(now))
-        if active_count < self.MIN_ACTIVE_NODES:
-            logger.error(
-                "Active oracle nodes (%d) below minimum required for quorum (%d)",
-                active_count,
-                self.MIN_ACTIVE_NODES,
-            )
-            new_threshold = self.MIN_ACTIVE_NODES
-        else:
-            new_threshold = min(self._base_threshold, active_count)
-            new_threshold = max(new_threshold, self.MIN_ACTIVE_NODES)
-
-        if new_threshold != self.threshold:
-            logger.info(
-                "Reconfiguring quorum threshold %d -> %d (active nodes: %d)",
-                self.threshold,
-                new_threshold,
-                active_count,
-            )
-            self.threshold = new_threshold
-
-        if active_count <= self.ALERT_ACTIVE_NODES:
-            logger.warning(
-                "Active oracle node count (%d) approaching minimum quorum requirement (%d)",
-                active_count,
-                self.MIN_ACTIVE_NODES,
-            )
-        return self.threshold
+        # Byzantine fault tolerance: tolerate f faulty nodes out of 3f+1.
+        self.tolerated_faults = (len(nodes) - 1) // 3
+        # A quorum of 2f+1 guarantees intersection with any other quorum.
+        self.required_quorum = 2 * self.tolerated_faults + 1
+        # Economic disincentive: stake slashed per proven misreport.
+        self.slash_amount = 1
+        self.slashed_nodes: dict[str, int] = {}
 
     def collect_signatures(
         self,
@@ -175,6 +118,67 @@ class OracleCoordinator:
             signers_count=len(signatures),
             threshold=self.threshold,
             is_valid_quorum=len(signatures) >= self.threshold,
+        )
+
+    def aggregate_reports(
+        self,
+        reports: dict[str, int],
+        slash: bool = True,
+    ) -> AggregationResult:
+        """Aggregate per-node score reports using a BFT-tolerant quorum rule.
+
+        The winning value is the one reported by at least ``2f + 1`` nodes.
+        Nodes whose report differs from the winning quorum are provably
+        inconsistent with consensus and are slashed (their stake is reduced).
+        """
+        counts = Counter(reports.values())
+        required = self.required_quorum
+        winner: int | None = None
+        for value, count in counts.most_common():
+            if count >= required:
+                winner = value
+                break
+
+        if winner is None:
+            logger.error(
+                "No BFT quorum: required %d agreeing reports, got %s",
+                required,
+                dict(counts),
+            )
+            return AggregationResult(
+                value=None,
+                agreeing=[],
+                dissenting=list(reports.keys()),
+                slashed=[],
+                quorum_size=0,
+                required_quorum=required,
+                tolerated_faults=self.tolerated_faults,
+                is_valid_quorum=False,
+            )
+
+        agreeing = [name for name, value in reports.items() if value == winner]
+        dissenting = [name for name, value in reports.items() if value != winner]
+        slashed: list[str] = []
+        if slash:
+            for name in dissenting:
+                self.slashed_nodes[name] = self.slashed_nodes.get(name, 0) + self.slash_amount
+                slashed.append(name)
+                logger.warning(
+                    "Slashing oracle %s: report %s inconsistent with quorum %s",
+                    name,
+                    reports[name],
+                    winner,
+                )
+
+        return AggregationResult(
+            value=winner,
+            agreeing=agreeing,
+            dissenting=dissenting,
+            slashed=slashed,
+            quorum_size=len(agreeing),
+            required_quorum=required,
+            tolerated_faults=self.tolerated_faults,
+            is_valid_quorum=True,
         )
 
     def submit_with_quorum(
