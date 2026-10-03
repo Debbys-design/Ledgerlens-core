@@ -5,6 +5,11 @@ satisfies ``score >= threshold`` without revealing the score or any raw
 feature values.
 
 The proof is non-interactive via the Fiat-Shamir heuristic.
+
+This module is the single supported prover path for LedgerLens. The former
+``detection/zk_snark_prover.py`` module has been deprecated and removed; all
+callers must import from here. See ``detection/zk_snark_prover.py`` for the
+migration shim that re-exports this module's public API.
 """
 
 from __future__ import annotations
